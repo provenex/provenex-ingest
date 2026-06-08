@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 axum = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 hex = "0.4"
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
