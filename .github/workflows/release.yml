@@ -13,6 +13,7 @@ jobs:
   build:
     name: build-${{ matrix.target }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -21,12 +22,16 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: provenex-ingest-${{ github.ref_name }}-linux-aarch64.tar.gz
-          - target: x86_64-apple-darwin
-            os: macos-13
-            artifact: provenex-ingest-${{ github.ref_name }}-darwin-x86_64.tar.gz
           - target: aarch64-apple-darwin
             os: macos-14
             artifact: provenex-ingest-${{ github.ref_name }}-darwin-aarch64.tar.gz
+    # x86_64-apple-darwin (Intel macOS) was previously in this matrix on
+    # macos-13. The free-tier macos-13 runner queue is unreliable for new
+    # GitHub orgs (45-90 min vs. the 1-2 min the build actually takes),
+    # which kept blocking the release job. Intel macOS users represent a
+    # shrinking share of the userbase; cargo install (which compiles
+    # native to whatever arch the user runs) covers them cleanly. Re-add
+    # the matrix entry once macos-13 queue behavior is fixed.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
