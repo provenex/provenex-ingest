@@ -1,6 +1,6 @@
 [package]
 name = "provenex-ingest"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Customer-side OTel-GenAI ingestor for Provenex (https://provenex.ai). Forwards OTLP/JSON traces with optional HMAC content-hashing for privacy-preserving ingestion."
 license = "Apache-2.0"
