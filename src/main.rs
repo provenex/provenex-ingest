@@ -75,7 +75,23 @@ struct Config {
     salt: String,
     mode: Mode,
     concurrent: usize,
+    /// Optional path to write a self-contained HTML report after each
+    /// verdict (`--report verdict.html`). One file per send/batch input;
+    /// for batch the file name has a `-<source>` suffix appended.
+    report: Option<String>,
+    /// When true (default for trial keys), POST each verdict to the
+    /// Provenex feedback endpoint so the team can see real-world catches
+    /// in real time. Turn off with `--no-feedback`.
+    feedback: bool,
+    /// Feedback endpoint URL. Configurable for self-hosted Provenex
+    /// deployments; default is the public signup Worker.
+    feedback_url: String,
+    /// Build version stamped on HTML reports + feedback envelopes.
+    binary_version: &'static str,
 }
+
+const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_FEEDBACK_URL: &str = "https://signup.provenex.ai/verdict-feedback";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -129,12 +145,26 @@ COMMON OPTIONS (all subcommands)
   --mode plain|hash           default plain
   --salt <salt>               per-tenant HMAC salt (required for --mode=hash)
   --concurrent <n>            max parallel uploads (default 4)
+  --report <path>             write a self-contained HTML report of the verdict
+                              alongside the JSON. For batch, the file stem is
+                              appended (e.g. `--report verdict.html` produces
+                              `verdict-01_echoleak.html`).
+  --no-feedback               opt out of sharing verdicts with Provenex (the
+                              default for trial keys is opt-IN so the team can
+                              see real-world catches; production keys are
+                              opt-out by default and must use --feedback to
+                              opt in).
+  --feedback                  explicit opt-in (overrides --no-feedback /
+                              PROVENEX_NO_FEEDBACK env).
 
 ENVIRONMENT VARIABLES
   PROVENEX_API_KEY            same as --api-key
   PROVENEX_UPSTREAM           same as --upstream
   PROVENEX_HMAC_SALT          same as --salt
   PROVENEX_MODE               same as --mode
+  PROVENEX_NO_FEEDBACK        same as --no-feedback (any non-empty truthy value)
+  PROVENEX_FEEDBACK_URL       feedback endpoint override
+                              (default https://signup.provenex.ai/verdict-feedback)
 
 EXAMPLES
   provenex-ingest send my-trace.otlp.json --api-key pvx_trial_xxx
@@ -162,6 +192,9 @@ async fn cmd_send(args: Vec<String>) -> anyhow::Result<()> {
     let client = build_http_client()?;
     let result = forward(&client, &cfg, bytes).await?;
     print_summary(&file, &result);
+    if let Err(e) = handle_postprocessing(&client, &cfg, &file, &result, None).await {
+        eprintln!("  (postprocessing: {e})");
+    }
     Ok(())
 }
 
@@ -292,6 +325,12 @@ fn parse_common(args: &[String]) -> anyhow::Result<(Config, Vec<String>)> {
         .unwrap_or_else(|_| "plain".into())
         .to_lowercase();
     let mut concurrent: usize = 4;
+    let mut report: Option<String> = None;
+    let mut no_feedback = std::env::var("PROVENEX_NO_FEEDBACK")
+        .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false);
+    let feedback_url = std::env::var("PROVENEX_FEEDBACK_URL")
+        .unwrap_or_else(|_| DEFAULT_FEEDBACK_URL.to_string());
 
     let mut positional: Vec<String> = Vec::new();
     let mut iter = args.iter().cloned();
@@ -325,6 +364,20 @@ fn parse_common(args: &[String]) -> anyhow::Result<(Config, Vec<String>)> {
                     .parse()
                     .map_err(|e| anyhow::anyhow!("--concurrent: {e}"))?;
             }
+            "--report" => {
+                report = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--report requires a path"))?,
+                );
+            }
+            "--no-feedback" => {
+                no_feedback = true;
+            }
+            "--feedback" => {
+                // Explicit opt-in (overrides PROVENEX_NO_FEEDBACK env, useful
+                // for a non-trial key that wants to share verdicts).
+                no_feedback = false;
+            }
             other => positional.push(other.to_string()),
         }
     }
@@ -343,6 +396,12 @@ fn parse_common(args: &[String]) -> anyhow::Result<(Config, Vec<String>)> {
         other => anyhow::bail!("--mode `{other}` invalid (use plain or hash)"),
     };
 
+    // Default-on for trial keys (pvx_trial_ prefix). Production keys must
+    // opt in explicitly via --feedback (we don't ship paying customers'
+    // verdicts back to us automatically).
+    let is_trial_key = api_key.starts_with("pvx_trial_");
+    let feedback = is_trial_key && !no_feedback;
+
     Ok((
         Config {
             upstream,
@@ -350,6 +409,10 @@ fn parse_common(args: &[String]) -> anyhow::Result<(Config, Vec<String>)> {
             salt,
             mode,
             concurrent,
+            report,
+            feedback,
+            feedback_url,
+            binary_version: BINARY_VERSION,
         },
         positional,
     ))
@@ -405,7 +468,21 @@ async fn process_files(
                 }
             };
             match forward(&client, &cfg, bytes).await {
-                Ok(result) => print_summary(&file_path.display().to_string(), &result),
+                Ok(result) => {
+                    let label = file_path.display().to_string();
+                    print_summary(&label, &result);
+                    if let Err(e) = handle_postprocessing(
+                        &client,
+                        &cfg,
+                        &label,
+                        &result,
+                        file_path.file_stem().and_then(|s| s.to_str()),
+                    )
+                    .await
+                    {
+                        eprintln!("  (postprocessing for {label}: {e})");
+                    }
+                }
                 Err(e) => eprintln!("  ✗ {}: {e}", file_path.display()),
             }
         });
@@ -539,6 +616,250 @@ fn transform_attributes(obj: &mut Map<String, Value>, salt: &str) {
             Value::String(format!("hmac-sha256:{hashed}")),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Postprocessing: HTML report + verdict-feedback POST.
+// ---------------------------------------------------------------------------
+
+/// Called after each successful `forward()`. Writes an HTML report if
+/// `--report` is set, and POSTs the verdict to the feedback endpoint if
+/// `--feedback` (default-on for trial keys, opt-out via `--no-feedback`).
+/// Errors are non-fatal: a failed report write or feedback POST should
+/// not break the customer's pipeline.
+async fn handle_postprocessing(
+    client: &reqwest::Client,
+    cfg: &Config,
+    source_label: &str,
+    result: &ForwardResult,
+    file_stem: Option<&str>,
+) -> anyhow::Result<()> {
+    let verdict_json: Value =
+        serde_json::from_str(&result.body).unwrap_or_else(|_| json!({ "raw": &result.body }));
+
+    if let Some(report_path) = cfg.report.as_deref() {
+        let path = derive_report_path(report_path, file_stem);
+        let html = render_verdict_html(source_label, &verdict_json, cfg.binary_version);
+        tokio::fs::write(&path, html)
+            .await
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+        println!("  report written: {}", path.display());
+    }
+
+    if cfg.feedback {
+        post_verdict_feedback(client, cfg, source_label, &verdict_json).await?;
+    }
+
+    Ok(())
+}
+
+/// If `--report verdict.html` is set and we're processing a single file,
+/// write to that path verbatim. For batch runs, append the file stem so
+/// `--report dir/verdict.html` becomes `dir/verdict-echoleak.html`,
+/// `dir/verdict-curxecute.html`, etc.
+fn derive_report_path(report_arg: &str, file_stem: Option<&str>) -> PathBuf {
+    let p = Path::new(report_arg);
+    match file_stem {
+        None => p.to_path_buf(),
+        Some(stem) => {
+            let parent = p.parent().unwrap_or_else(|| Path::new("."));
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("html");
+            let base = p.file_stem().and_then(|s| s.to_str()).unwrap_or("verdict");
+            parent.join(format!("{base}-{stem}.{ext}"))
+        }
+    }
+}
+
+fn render_verdict_html(source_label: &str, verdict: &Value, version: &str) -> String {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+    let red = verdict
+        .get("red_verdicts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let receipts_ingested = verdict
+        .get("receipts_ingested")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let tenant = verdict
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+    let verdicts = verdict
+        .get("verdicts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let badge = if red > 0 { "RED" } else { "OK" };
+    let badge_class = if red > 0 { "badge-red" } else { "badge-ok" };
+    let headline = verdicts
+        .first()
+        .and_then(|v| v.get("binding_reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(if red == 0 {
+            "No red verdicts; closure walked clean."
+        } else {
+            "Cross-zone composition detected."
+        });
+
+    let mut verdict_cards = String::new();
+    for (i, vd) in verdicts.iter().enumerate() {
+        let binding = vd
+            .get("binding_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unclassified)");
+        let risk = vd.get("risk").and_then(|v| v.as_str()).unwrap_or("?");
+        let key = vd
+            .get("correlation_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let explanation = vd
+            .get("explanation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        verdict_cards.push_str(&format!(
+            r#"<div class="card">
+  <div class="card-header"><span class="binding">{binding}</span><span class="risk risk-{risk_lc}">{risk}</span><span class="idx">#{idx}</span></div>
+  <p class="explanation">{explanation}</p>
+  <p class="key">correlation: <code>{key}</code></p>
+</div>
+"#,
+            binding = html_escape(binding),
+            risk = html_escape(risk),
+            risk_lc = risk.to_ascii_lowercase(),
+            idx = i + 1,
+            key = html_escape(key),
+            explanation = html_escape(explanation),
+        ));
+    }
+
+    let raw_pretty = serde_json::to_string_pretty(verdict).unwrap_or_else(|_| String::new());
+    let raw_escaped = html_escape(&raw_pretty);
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Provenex verdict — {headline_esc}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; max-width: 920px; margin: 2rem auto; padding: 0 1rem; color: #1f1f1f; line-height: 1.55; background: #fafafa; }}
+  h1 {{ font-size: 1.7rem; margin: 0 0 .3rem; }}
+  h2 {{ font-size: 1.1rem; margin: 2rem 0 .8rem; padding-bottom: .25rem; border-bottom: 1px solid #ddd; color: #444; }}
+  .badge {{ display: inline-block; padding: 2px 10px; border-radius: 4px; font-weight: 700; font-size: 0.85rem; letter-spacing: .04em; margin-right: .5rem; }}
+  .badge-red {{ background: #d83b3b; color: #fff; }}
+  .badge-ok {{ background: #2c9c5e; color: #fff; }}
+  .meta {{ color: #666; margin: .25rem 0 1.5rem; font-size: 0.9rem; }}
+  .stats {{ display: flex; gap: 1.5rem; padding: 1rem 1.25rem; background: #fff; border: 1px solid #e5e5e5; border-radius: 8px; margin: 1.5rem 0; }}
+  .stat {{ flex: 1; }}
+  .stat-label {{ font-size: 0.85rem; color: #666; text-transform: uppercase; letter-spacing: .04em; }}
+  .stat-value {{ font-size: 1.4rem; font-weight: 700; margin-top: 4px; }}
+  .card {{ background: #fff; border: 1px solid #e5e5e5; border-left: 4px solid #d83b3b; border-radius: 6px; padding: 1rem 1.25rem; margin: .75rem 0; }}
+  .card-header {{ display: flex; align-items: center; gap: .75rem; margin-bottom: .4rem; }}
+  .binding {{ font-weight: 700; font-family: ui-monospace, Menlo, monospace; font-size: 0.95rem; color: #d83b3b; }}
+  .risk {{ font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; font-weight: 700; text-transform: uppercase; }}
+  .risk-high {{ background: #fee; color: #a00; }}
+  .risk-medium {{ background: #fff5d6; color: #9a6800; }}
+  .risk-low {{ background: #e6f4ea; color: #2c7a3f; }}
+  .risk-unknown {{ background: #eee; color: #555; }}
+  .idx {{ margin-left: auto; color: #888; font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; }}
+  .explanation {{ margin: .35rem 0; }}
+  .key {{ font-size: 0.85rem; color: #666; margin: .2rem 0 0; }}
+  code {{ background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 0.88em; }}
+  pre {{ background: #1f1f1f; color: #e6e6e6; padding: 1rem 1.25rem; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; line-height: 1.45; }}
+  details {{ margin: 1rem 0; }}
+  details summary {{ cursor: pointer; color: #5560b4; font-weight: 500; padding: .5rem 0; }}
+  footer {{ margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #ddd; color: #777; font-size: 0.9rem; }}
+  footer a {{ color: #5560b4; }}
+  .source-label {{ font-family: ui-monospace, Menlo, monospace; color: #444; font-size: 0.9rem; }}
+</style>
+</head>
+<body>
+<header>
+  <span class="badge {badge_class}">{badge}</span>
+  <h1>{headline_esc}</h1>
+  <p class="meta">Source: <span class="source-label">{source_esc}</span></p>
+</header>
+
+<div class="stats">
+  <div class="stat"><div class="stat-label">Egress points evaluated</div><div class="stat-value">{receipts_ingested}</div></div>
+  <div class="stat"><div class="stat-label">Red verdicts</div><div class="stat-value">{red}</div></div>
+  <div class="stat"><div class="stat-label">Tenant</div><div class="stat-value" style="font-family: ui-monospace, Menlo, monospace; font-size: 0.95rem; word-break: break-all;">{tenant_esc}</div></div>
+</div>
+
+<h2>Verdicts ({n_verdicts})</h2>
+{verdict_cards}
+
+<h2>Raw response</h2>
+<details>
+  <summary>Show raw verdict JSON</summary>
+  <pre>{raw_escaped}</pre>
+</details>
+
+<footer>
+  <p>Generated by <code>provenex-ingest v{version}</code> on {now}.</p>
+  <p>Questions / feedback: <a href="mailto:skulk@provenex.ai">skulk@provenex.ai</a> · <a href="https://provenex.ai">provenex.ai</a></p>
+  <p style="margin-top: 1rem; font-size: 0.85rem; color: #888;">
+    Each verdict in the response carries an <code>ed25519</code>-signed artifact under the
+    <code>trial-2026-06</code> key (retrievable via <code>/v1/verdicts</code>) so the closure
+    is verifiable even after this HTML report is forwarded onward.
+  </p>
+</footer>
+</body>
+</html>
+"#,
+        headline_esc = html_escape(headline),
+        source_esc = html_escape(source_label),
+        tenant_esc = html_escape(tenant),
+        n_verdicts = verdicts.len(),
+    )
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+async fn post_verdict_feedback(
+    client: &reqwest::Client,
+    cfg: &Config,
+    source_label: &str,
+    verdict: &Value,
+) -> anyhow::Result<()> {
+    // Mask the API key so the team can correlate the verdict back to a
+    // tenant without ever seeing the full secret. First 14 chars = the
+    // `pvx_trial_` prefix + 4 nonce chars.
+    let key_prefix: String = cfg.api_key.chars().take(14).collect();
+    let envelope = json!({
+        "api_key_prefix": key_prefix,
+        "tenant_id": verdict.get("tenant_id").cloned().unwrap_or(Value::Null),
+        "source": source_label,
+        "binary_version": cfg.binary_version,
+        "verdict_response": verdict,
+    });
+    let resp = client
+        .post(&cfg.feedback_url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&envelope)?)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("feedback POST: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("feedback POST returned {}", resp.status());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
