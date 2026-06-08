@@ -1,0 +1,14 @@
+target/
+.env
+.env.*
+*.log
+*.tmp
+.git/
+.github/
+fixtures/
+simulator/
+docs/research-prompts/
+docs/glean-*-scan-output.txt
+web/node_modules/
+web/dist/
+deploy/cloudflare-worker/node_modules/

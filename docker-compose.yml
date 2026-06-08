@@ -1,0 +1,35 @@
+# Reference docker-compose for customers running provenex-ingest-proxy
+# alongside their existing OTel Collector.
+#
+# Pattern: the Collector exports to the ingest-proxy, which hashes
+# content fields locally and forwards to api.provenex.ai.
+
+services:
+  provenex-ingest-proxy:
+    image: ghcr.io/provenex/ingest-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "4318:4318"
+    environment:
+      PROVENEX_INGEST_BIND: "0.0.0.0:4318"
+      PROVENEX_UPSTREAM: "https://api.provenex.ai"
+      PROVENEX_MODE: "hash"
+      PROVENEX_API_KEY: "${PROVENEX_API_KEY}"
+      PROVENEX_HMAC_SALT: "${PROVENEX_HMAC_SALT}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://127.0.0.1:4318/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # The customer's existing OTel Collector — config exports to the
+  # proxy above. Reference shape; adjust to your actual collector.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel/config.yaml:ro
+    depends_on:
+      provenex-ingest-proxy:
+        condition: service_healthy

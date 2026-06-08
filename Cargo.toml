@@ -1,0 +1,32 @@
+[package]
+name = "provenex-ingest"
+version = "0.1.0"
+edition = "2021"
+description = "Customer-side OTel-GenAI ingestor for Provenex (https://provenex.ai). Forwards OTLP/JSON traces with optional HMAC content-hashing for privacy-preserving ingestion."
+license = "Apache-2.0"
+repository = "https://github.com/provenex/provenex-ingest"
+homepage = "https://provenex.ai"
+keywords = ["opentelemetry", "otlp", "ai-security", "agent-telemetry"]
+categories = ["command-line-utilities", "web-programming"]
+authors = ["Provenex Inc."]
+readme = "README.md"
+
+[[bin]]
+name = "provenex-ingest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+hex = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+opt-level = "z"
