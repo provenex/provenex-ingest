@@ -837,12 +837,11 @@ async fn post_verdict_feedback(
     source_label: &str,
     verdict: &Value,
 ) -> anyhow::Result<()> {
-    // Mask the API key so the team can correlate the verdict back to a
-    // tenant without ever seeing the full secret. First 14 chars = the
-    // `pvx_trial_` prefix + 4 nonce chars.
-    let key_prefix: String = cfg.api_key.chars().take(14).collect();
+    // tenant_id is the only correlation identifier we send. The previous
+    // `api_key_prefix` field was a stable per-tenant fingerprint that doubled
+    // up with tenant_id; the team can join on tenant_id alone for the same
+    // operational benefit without putting any of the secret on the wire.
     let envelope = json!({
-        "api_key_prefix": key_prefix,
         "tenant_id": verdict.get("tenant_id").cloned().unwrap_or(Value::Null),
         "source": source_label,
         "binary_version": cfg.binary_version,
