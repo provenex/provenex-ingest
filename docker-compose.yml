@@ -1,8 +1,12 @@
-# Reference docker-compose for customers running provenex-ingest-proxy
-# alongside their existing OTel Collector.
+# SUPERSEDED for ADR-008 customer evaluations. This legacy proxy forwards raw
+# or partially hashed OTLP centrally and does not provide the local workspace,
+# Data Custody view, or enforcement proof. Do not point it at the shared Fly
+# scorer. Retained only to audit prior releases.
 #
-# Pattern: the Collector exports to the ingest-proxy, which hashes
-# content fields locally and forwards to api.provenex.ai.
+# Historical reference for provenex-ingest-proxy alongside an OTel Collector.
+#
+# Historical pattern: the Collector exports to the proxy, which hashes selected
+# content fields and forwards to an explicitly chosen legacy upstream.
 
 services:
   provenex-ingest-proxy:
@@ -12,7 +16,7 @@ services:
       - "4318:4318"
     environment:
       PROVENEX_INGEST_BIND: "0.0.0.0:4318"
-      PROVENEX_UPSTREAM: "https://api.provenex.ai"
+      PROVENEX_UPSTREAM: "${PROVENEX_UPSTREAM:?legacy upstream must be explicit}"
       PROVENEX_MODE: "hash"
       PROVENEX_API_KEY: "${PROVENEX_API_KEY}"
       PROVENEX_HMAC_SALT: "${PROVENEX_HMAC_SALT}"

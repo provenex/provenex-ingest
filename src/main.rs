@@ -79,9 +79,10 @@ struct Config {
     /// verdict (`--report verdict.html`). One file per send/batch input;
     /// for batch the file name has a `-<source>` suffix appended.
     report: Option<String>,
-    /// When true (default for trial keys), POST each verdict to the
-    /// Provenex feedback endpoint so the team can see real-world catches
-    /// in real time. Turn off with `--no-feedback`.
+    /// When true (default for trial keys), POST a summary of each verdict
+    /// (counts, binding reasons, risk levels; no content, URIs, or
+    /// correlation keys) to the Provenex feedback endpoint so the team can
+    /// see real-world catches in real time. Turn off with `--no-feedback`.
     feedback: bool,
     /// Feedback endpoint URL. Configurable for self-hosted Provenex
     /// deployments; default is the public signup Worker.
@@ -149,11 +150,13 @@ COMMON OPTIONS (all subcommands)
                               alongside the JSON. For batch, the file stem is
                               appended (e.g. `--report verdict.html` produces
                               `verdict-01_echoleak.html`).
-  --no-feedback               opt out of sharing verdicts with Provenex (the
-                              default for trial keys is opt-IN so the team can
-                              see real-world catches; production keys are
-                              opt-out by default and must use --feedback to
-                              opt in).
+  --no-feedback               opt out of sharing verdict SUMMARIES with Provenex
+                              (counts, binding reasons, risk levels only; no
+                              message content, resource URIs, or correlation
+                              keys leave your environment). The default for
+                              trial keys is opt-IN so the team can see
+                              real-world catches; production keys are opt-out
+                              by default and must use --feedback to opt in.
   --feedback                  explicit opt-in (overrides --no-feedback /
                               PROVENEX_NO_FEEDBACK env).
 
@@ -209,32 +212,18 @@ async fn cmd_batch(args: Vec<String>) -> anyhow::Result<()> {
         eprintln!("no *.otlp.json files in {dir}");
         return Ok(());
     }
-    println!("posting {} files from {dir} (mode={:?})", files.len(), cfg.mode);
+    println!(
+        "posting {} files from {dir} (mode={:?})",
+        files.len(),
+        cfg.mode
+    );
     let client = build_http_client()?;
     process_files(client, Arc::new(cfg), files).await
 }
 
 async fn cmd_watch(args: Vec<String>) -> anyhow::Result<()> {
-    let (cfg, mut positional) = parse_common(&args)?;
-    let dir = positional
-        .iter()
-        .next()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("watch requires a directory argument"))?;
-    positional.remove(0);
-
-    // Parse --interval out of remaining positional (kept simple for the CLI).
-    let mut interval_secs = 5u64;
-    let mut iter = positional.into_iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--interval" {
-            interval_secs = iter
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("--interval requires a value"))?
-                .parse()
-                .map_err(|e| anyhow::anyhow!("--interval: {e}"))?;
-        }
-    }
+    let (cfg, positional) = parse_common(&args)?;
+    let (dir, interval_secs) = parse_watch_args(positional)?;
 
     println!(
         "watching {dir} every {interval_secs}s (mode={:?}); already-processed files are skipped.\nCtrl-C to stop.",
@@ -246,10 +235,7 @@ async fn cmd_watch(args: Vec<String>) -> anyhow::Result<()> {
 
     loop {
         let files = scan_otlp_files(Path::new(&dir)).await?;
-        let fresh: Vec<PathBuf> = files
-            .into_iter()
-            .filter(|p| !seen.contains(p))
-            .collect();
+        let fresh: Vec<PathBuf> = files.into_iter().filter(|p| !seen.contains(p)).collect();
         if !fresh.is_empty() {
             for f in &fresh {
                 seen.insert(f.clone());
@@ -259,6 +245,31 @@ async fn cmd_watch(args: Vec<String>) -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
     }
+}
+
+/// Parse watch-mode args from the positional remainder parse_common left us.
+/// `--interval N` is extracted FIRST so its value is never mistaken for the
+/// directory; the directory is then the first remaining non-`--` token
+/// (previously `positional[0]` could be a flag or a flag's value).
+fn parse_watch_args(positional: Vec<String>) -> anyhow::Result<(String, u64)> {
+    let mut interval_secs = 5u64;
+    let mut dir: Option<String> = None;
+    let mut iter = positional.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--interval" {
+            interval_secs = iter
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--interval requires a value"))?
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--interval: {e}"))?;
+        } else if arg.starts_with("--") {
+            anyhow::bail!("watch: unknown option `{arg}`");
+        } else if dir.is_none() {
+            dir = Some(arg);
+        }
+    }
+    let dir = dir.ok_or_else(|| anyhow::anyhow!("watch requires a directory argument"))?;
+    Ok((dir, interval_secs))
 }
 
 async fn cmd_listen(args: Vec<String>) -> anyhow::Result<()> {
@@ -308,7 +319,21 @@ async fn receive(
     let res = forward(&state.client, &state.cfg, body.to_vec())
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("forward: {e}")))?;
-    let parsed: Value = serde_json::from_str(&res.body).unwrap_or_else(|_| json!({ "raw": res.body }));
+    // Propagate a non-2xx upstream status instead of returning 200: a
+    // swallowed failure would make the customer's collector mark the batch
+    // delivered and drop it. 4xx pass through (the collector should NOT
+    // retry a rejected payload forever); everything else maps to 502 so the
+    // collector's retry/backoff engages.
+    if !(200..300).contains(&res.status) {
+        let status = if (400..500).contains(&res.status) {
+            StatusCode::from_u16(res.status).unwrap_or(StatusCode::BAD_GATEWAY)
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return Err((status, res.body));
+    }
+    let parsed: Value =
+        serde_json::from_str(&res.body).unwrap_or_else(|_| json!({ "raw": res.body }));
     Ok(Json(parsed))
 }
 
@@ -317,8 +342,8 @@ async fn receive(
 // ---------------------------------------------------------------------------
 
 fn parse_common(args: &[String]) -> anyhow::Result<(Config, Vec<String>)> {
-    let mut upstream = std::env::var("PROVENEX_UPSTREAM")
-        .unwrap_or_else(|_| "https://api.provenex.ai".into());
+    let mut upstream =
+        std::env::var("PROVENEX_UPSTREAM").unwrap_or_else(|_| "https://api.provenex.ai".into());
     let mut api_key = std::env::var("PROVENEX_API_KEY").unwrap_or_default();
     let mut salt = std::env::var("PROVENEX_HMAC_SALT").unwrap_or_default();
     let mut mode_str = std::env::var("PROVENEX_MODE")
@@ -329,8 +354,8 @@ fn parse_common(args: &[String]) -> anyhow::Result<(Config, Vec<String>)> {
     let mut no_feedback = std::env::var("PROVENEX_NO_FEEDBACK")
         .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
         .unwrap_or(false);
-    let feedback_url = std::env::var("PROVENEX_FEEDBACK_URL")
-        .unwrap_or_else(|_| DEFAULT_FEEDBACK_URL.to_string());
+    let feedback_url =
+        std::env::var("PROVENEX_FEEDBACK_URL").unwrap_or_else(|_| DEFAULT_FEEDBACK_URL.to_string());
 
     let mut positional: Vec<String> = Vec::new();
     let mut iter = args.iter().cloned();
@@ -500,7 +525,11 @@ struct ForwardResult {
     body: String,
 }
 
-async fn forward(client: &reqwest::Client, cfg: &Config, body: Vec<u8>) -> anyhow::Result<ForwardResult> {
+async fn forward(
+    client: &reqwest::Client,
+    cfg: &Config,
+    body: Vec<u8>,
+) -> anyhow::Result<ForwardResult> {
     let transformed = match cfg.mode {
         Mode::Plain => body,
         Mode::Hash => hash_otlp_body(&body, &cfg.salt)?,
@@ -521,7 +550,10 @@ async fn forward(client: &reqwest::Client, cfg: &Config, body: Vec<u8>) -> anyho
 
 fn print_summary(label: &str, result: &ForwardResult) {
     let parsed: Value = serde_json::from_str(&result.body).unwrap_or_else(|_| json!({}));
-    let red = parsed.get("red_verdicts").and_then(|v| v.as_u64()).unwrap_or(0);
+    let red = parsed
+        .get("red_verdicts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let egress = parsed
         .get("receipts_ingested")
         .and_then(|v| v.as_u64())
@@ -558,15 +590,14 @@ fn print_summary(label: &str, result: &ForwardResult) {
 // ---------------------------------------------------------------------------
 
 fn hmac_content(content: &str, salt: &str) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(salt.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(salt.as_bytes()).expect("HMAC accepts any key length");
     mac.update(content.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
 
 fn hash_otlp_body(body: &[u8], salt: &str) -> anyhow::Result<Vec<u8>> {
-    let mut payload: Value = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("parse OTLP JSON: {e}"))?;
+    let mut payload: Value =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("parse OTLP JSON: {e}"))?;
     walk(&mut payload, salt);
     Ok(serde_json::to_vec(&payload)?)
 }
@@ -588,6 +619,17 @@ fn walk(v: &mut Value, salt: &str) {
     }
 }
 
+/// Hash one OTLP attribute object (`{ "key": ..., "value": { ... } }`) in
+/// place when its key is a content/identity field. `walk` calls this on EVERY
+/// object in the payload, so span attributes AND span `events[].attributes`
+/// both pass through here.
+///
+/// Coverage note: many SDKs emit `gen_ai.input.messages` as a structured
+/// `arrayValue`/`kvlistValue` rather than a `stringValue`. Those are hashed
+/// too: the whole AnyValue is serialized to canonical JSON (sorted object
+/// keys) and HMAC'd, and the value is REPLACED with a `stringValue` so no
+/// structured content leaks. This keeps the file-header promise that content
+/// never leaves the customer environment un-hashed in --mode=hash.
 fn transform_attributes(obj: &mut Map<String, Value>, salt: &str) {
     let Some(key_val) = obj.get("key") else {
         return;
@@ -599,22 +641,53 @@ fn transform_attributes(obj: &mut Map<String, Value>, salt: &str) {
     if !redact {
         return;
     }
-    let Some(value) = obj.get_mut("value") else {
+    let Some(value) = obj.get("value") else {
         return;
     };
-    let Some(value_obj) = value.as_object_mut() else {
+    let Some(value_map) = value.as_object() else {
         return;
     };
-    if let Some(s) = value_obj
-        .get("stringValue")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-    {
-        let hashed = hmac_content(&s, salt);
-        value_obj.insert(
-            "stringValue".into(),
-            Value::String(format!("hmac-sha256:{hashed}")),
-        );
+    let hashed = if let Some(s) = value_map.get("stringValue").and_then(|v| v.as_str()) {
+        hmac_content(s, salt)
+    } else if !value_map.is_empty() {
+        // arrayValue / kvlistValue / intValue / anything else under a
+        // content key: canonicalize and hash the whole AnyValue.
+        hmac_content(&canonical_json(value), salt)
+    } else {
+        return;
+    };
+    obj.insert(
+        "value".into(),
+        json!({ "stringValue": format!("hmac-sha256:{hashed}") }),
+    );
+}
+
+/// Deterministic JSON serialization: object keys sorted lexicographically at
+/// every level (serde_json's Map ordering depends on crate features, so we
+/// don't rely on it). Used so the same structured content always HMACs to the
+/// same digest.
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut pairs: Vec<(&String, &Value)> = map.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            let inner: Vec<String> = pairs
+                .iter()
+                .map(|(k, val)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap_or_default(),
+                        canonical_json(val)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
     }
 }
 
@@ -713,10 +786,7 @@ fn render_verdict_html(source_label: &str, verdict: &Value, version: &str) -> St
             .get("correlation_key")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        let explanation = vd
-            .get("explanation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let explanation = vd.get("explanation").and_then(|v| v.as_str()).unwrap_or("");
         verdict_cards.push_str(&format!(
             r#"<div class="card">
   <div class="card-header"><span class="binding">{binding}</span><span class="risk risk-{risk_lc}">{risk}</span><span class="idx">#{idx}</span></div>
@@ -841,11 +911,15 @@ async fn post_verdict_feedback(
     // `api_key_prefix` field was a stable per-tenant fingerprint that doubled
     // up with tenant_id; the team can join on tenant_id alone for the same
     // operational benefit without putting any of the secret on the wire.
+    //
+    // Privacy: only a SUMMARY leaves the box (counts, binding reasons, and
+    // risk levels). Resource URIs, correlation keys, explanations, and the
+    // findings narrative are all stripped; see feedback_summary.
     let envelope = json!({
         "tenant_id": verdict.get("tenant_id").cloned().unwrap_or(Value::Null),
         "source": source_label,
         "binary_version": cfg.binary_version,
-        "verdict_response": verdict,
+        "verdict_summary": feedback_summary(verdict),
     });
     let resp = client
         .post(&cfg.feedback_url)
@@ -859,6 +933,33 @@ async fn post_verdict_feedback(
         anyhow::bail!("feedback POST returned {}", resp.status());
     }
     Ok(())
+}
+
+/// Reduce a full verdict response to the share-with-Provenex summary: counts,
+/// per-verdict (verdict, risk, binding_reason) triples, and nothing else. No
+/// resource URIs, correlation keys, explanations, or findings content.
+fn feedback_summary(verdict: &Value) -> Value {
+    let verdicts: Vec<Value> = verdict
+        .get("verdicts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|v| {
+                    json!({
+                        "verdict": v.get("verdict").cloned().unwrap_or(Value::Null),
+                        "risk": v.get("risk").cloned().unwrap_or(Value::Null),
+                        "binding_reason": v.get("binding_reason").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "accepted": verdict.get("accepted").cloned().unwrap_or(Value::Null),
+        "receipts_ingested": verdict.get("receipts_ingested").cloned().unwrap_or(Value::Null),
+        "red_verdicts": verdict.get("red_verdicts").cloned().unwrap_or(Value::Null),
+        "verdicts": verdicts,
+    })
 }
 
 #[cfg(test)]
@@ -904,5 +1005,98 @@ mod tests {
         assert!(s.contains("outlook://mailbox/inbox/external/promo"));
         assert!(s.contains("gen_ai.operation.name"));
         assert!(s.contains("\"chat\""));
+    }
+
+    #[test]
+    fn hash_otlp_hashes_structured_array_values_and_event_attributes() {
+        // gen_ai.input.messages as an arrayValue (the shape many SDKs emit)
+        // plus a content field inside span events[].attributes; both must be
+        // HMAC'd, not passed through.
+        let payload = serde_json::json!({
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "spans": [{
+                        "attributes": [
+                            { "key": "gen_ai.input.messages", "value": { "arrayValue": { "values": [
+                                { "kvlistValue": { "values": [
+                                    { "key": "role", "value": { "stringValue": "user" } },
+                                    { "key": "content", "value": { "stringValue": "secret prompt body" } }
+                                ] } }
+                            ] } } }
+                        ],
+                        "events": [{
+                            "name": "gen_ai.content.completion",
+                            "attributes": [
+                                { "key": "gen_ai.output.messages", "value": { "stringValue": "secret completion" } }
+                            ]
+                        }]
+                    }]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&payload).unwrap();
+        let out = hash_otlp_body(&body, "the-salt").unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            !s.contains("secret prompt body"),
+            "structured content leaked: {s}"
+        );
+        assert!(
+            !s.contains("secret completion"),
+            "event content leaked: {s}"
+        );
+        assert!(
+            !s.contains("arrayValue"),
+            "structured value not replaced: {s}"
+        );
+        assert!(s.contains("hmac-sha256:"));
+    }
+
+    #[test]
+    fn canonical_json_is_key_order_independent() {
+        let a: Value = serde_json::from_str(r#"{"b":1,"a":[{"y":2,"x":3}]}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"a":[{"x":3,"y":2}],"b":1}"#).unwrap();
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+    }
+
+    #[test]
+    fn parse_watch_args_handles_interval_before_directory() {
+        let (dir, interval) =
+            parse_watch_args(vec!["--interval".into(), "2".into(), "captures/".into()]).unwrap();
+        assert_eq!(dir, "captures/");
+        assert_eq!(interval, 2);
+
+        let (dir, interval) =
+            parse_watch_args(vec!["captures/".into(), "--interval".into(), "9".into()]).unwrap();
+        assert_eq!(dir, "captures/");
+        assert_eq!(interval, 9);
+
+        assert!(parse_watch_args(vec!["--interval".into(), "2".into()]).is_err());
+    }
+
+    #[test]
+    fn feedback_summary_strips_uris_and_correlation_keys() {
+        let verdict = serde_json::json!({
+            "accepted": true,
+            "receipts_ingested": 3,
+            "red_verdicts": 1,
+            "tenant_id": "t-1",
+            "verdicts": [{
+                "verdict": "red",
+                "risk": "high",
+                "binding_reason": "untrusted->egress",
+                "correlation_key": "corr-001",
+                "explanation": "external email reached https://attacker.example.com"
+            }],
+            "findings": [{ "retrieved": [{"uri": "outlook://x"}] }]
+        });
+        let summary = feedback_summary(&verdict);
+        let s = serde_json::to_string(&summary).unwrap();
+        assert!(s.contains("untrusted->egress"));
+        assert!(s.contains("\"red_verdicts\":1"));
+        assert!(!s.contains("corr-001"));
+        assert!(!s.contains("attacker.example.com"));
+        assert!(!s.contains("outlook://x"));
+        assert!(!s.contains("findings"));
     }
 }
